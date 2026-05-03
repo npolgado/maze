@@ -1,7 +1,6 @@
 # TODO
 
-
-# MVP 
+# Minimal Viable Product 
 - [x] Write code to generate a braid maze.
 
 ## Requirements:
