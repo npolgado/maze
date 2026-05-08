@@ -47,6 +47,36 @@ Edge = Tuple[Cell, Cell]
 DEFAULT_SEEDS = [101, 202, 303, 404, 505, 606, 707, 808, 909, 1001]
 DEFAULT_SIZES = [(12, 12), (20, 20), (30, 30)]
 
+COMPONENT_ORDER = [
+    'hard_constraints', 'loop_depth', 'start_finish', 'redundancy',
+    'backtrack_pressure', 'decision_structure', 'corridor_monotony',
+    'exploration_pace', 'degree_entropy', 'detour_factor',
+    'local_recoverability', 'tiny_loop_suppression',
+]
+
+_COMPONENT_WEIGHT = dict(
+    hard_constraints=0.18, loop_depth=0.12, start_finish=0.11,
+    redundancy=0.10, backtrack_pressure=0.08, decision_structure=0.08,
+    corridor_monotony=0.07, exploration_pace=0.06, degree_entropy=0.06,
+    detour_factor=0.06, local_recoverability=0.05, tiny_loop_suppression=0.03,
+)
+
+_COMPONENT_LABEL = dict(
+    hard_constraints='hard constraints',
+    loop_depth='loop depth',
+    start_finish='start→finish',
+    redundancy='redundancy',
+    backtrack_pressure='backtrack pressure',
+    decision_structure='decision structure',
+    corridor_monotony='corridor monotony',
+    exploration_pace='exploration pace',
+    degree_entropy='degree entropy',
+    detour_factor='detour factor',
+    local_recoverability='local recovery',
+    tiny_loop_suppression='tiny loop supp.',
+)
+
+
 
 @dataclass
 class MazeData:
@@ -1349,6 +1379,26 @@ def summarize_external_runs(runs: Sequence[Dict[str, Any]]) -> Dict[str, Dict[st
     return summary
 
 
+def aggregate_components_by_generator(runs):
+    by_gen = {}
+    for run in runs:
+        if not run.get("success"):
+            continue
+        components = run.get("quality_components")
+        if not isinstance(components, dict):
+            continue
+        gen = str(run.get("generator", "unknown"))
+        acc = by_gen.setdefault(gen, {})
+        for comp, val in components.items():
+            if isinstance(val, (int, float)):
+                acc.setdefault(comp, []).append(float(val))
+    import statistics
+    return {
+        gen: {comp: statistics.fmean(vals) for comp, vals in comps.items()}
+        for gen, comps in by_gen.items()
+    }
+
+
 def load_report_digest(path: Path) -> Optional[ReportDigest]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1423,12 +1473,19 @@ def build_visual_summary_data(digests: Sequence[ReportDigest]) -> Dict[str, Any]
                     "hard_pass": bool(run.get("hard_pass", False)),
                     "quality_score": _as_float(run.get("quality_score"), 0.0),
                     "elapsed_ms": _as_float(run.get("elapsed_ms"), 0.0),
+                    "quality_components": {
+                        k: float(v)
+                        for k, v in run.get("quality_components", {}).items()
+                        if isinstance(v, (int, float))
+                    },
                 }
             )
 
     aggregate = summarize_external_runs(all_runs)
     successful = [run for run in all_runs if run["success"]]
     best_runs = sorted(successful, key=lambda run: run["quality_score"], reverse=True)[:12]
+
+    component_breakdown = aggregate_components_by_generator(all_runs)
 
     report_rows = []
     for digest in digests:
@@ -1448,6 +1505,7 @@ def build_visual_summary_data(digests: Sequence[ReportDigest]) -> Dict[str, Any]
         "successful_runs": successful,
         "aggregate_per_generator": aggregate,
         "best_runs": best_runs,
+        "component_breakdown": component_breakdown,
     }
 
 
@@ -1577,12 +1635,238 @@ def render_terminal_visual_summary(visual: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_component_panel(visual: Dict[str, Any]) -> str:
+    component_breakdown = visual.get('component_breakdown')
+    if not component_breakdown:
+        return ''
+
+    radar_svg = render_radar_svg(component_breakdown, COMPONENT_ORDER)
+    bars_svg = render_component_bars_svg(component_breakdown, COMPONENT_ORDER)
+    table_html = _render_component_table(component_breakdown, COMPONENT_ORDER)
+
+    panel_open = '<div class="panel" id="comp-panel">'
+    tab_bar = (
+        '<div class="tab-bar">'
+        + '<button class="tab-btn active" data-tab="comp-radar" onclick="showTab(\'comp-panel\',this)">Radar</button>'
+        + '<button class="tab-btn" data-tab="comp-bars" onclick="showTab(\'comp-panel\',this)">Bar Chart</button>'
+        + '<button class="tab-btn" data-tab="comp-table" onclick="showTab(\'comp-panel\',this)">Table</button>'
+        + '</div>'
+    )
+    pane_radar = '<div id="comp-radar" class="tab-pane active">' + radar_svg + '</div>'
+    pane_bars = '<div id="comp-bars" class="tab-pane">' + bars_svg + '</div>'
+    pane_table = '<div id="comp-table" class="tab-pane">' + table_html + '</div>'
+    return (
+        '\n    ' + panel_open + '\n      <h2>Component Breakdown</h2>\n      '
+        + tab_bar + '\n      '
+        + pane_radar + '\n      '
+        + pane_bars + '\n      '
+        + pane_table + '\n    </div>'
+    )
+
+
+def render_radar_svg(component_means: Dict[str, Dict[str, float]], component_order: List[str]) -> str:
+    # SVG setup
+    svg = '<svg viewBox="0 0 680 540" overflow="visible" width="100%">'
+
+    cx, cy = 340.0, 280.0
+    outer_radius = 200.0
+
+    def angle_for_axis(i: int) -> float:
+        # 12 axes, starting at 270° going clockwise
+        # angle = 270 - i * 30 + 360 (normalized to 0-360)
+        return (270 - i * 30 + 360) % 360
+
+    def xyz_from_axis(i: int) -> Tuple[float, float, float]:
+        angle_deg = angle_for_axis(i)
+        angle_rad = math.radians(angle_deg)
+        x = cx + outer_radius * math.cos(angle_rad)
+        y = cy + outer_radius * math.sin(angle_rad)
+        return x, y, angle_rad
+
+    def score_for_component(mean_data: Dict[str, float], component_name: str) -> float:
+        return mean_data.get(component_name, 0.0)
+
+    # Draw 4 background rings
+    for radius in (50, 100, 150, outer_radius):
+        svg += f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius}" stroke="#ccc" stroke-width="1" fill="none"/>'
+
+    # Draw 12 axis lines
+    for i in range(12):
+        x, y, _ = xyz_from_axis(i)
+        svg += f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{x:.1f}" y2="{y:.1f}" stroke="#ccc" stroke-width="1"/>'
+
+    # Draw polygons and dots for each generator
+    for gen, scores in component_means.items():
+        gen_color = _generator_color(gen)
+        points = []
+        for i, component_name in enumerate(component_order):
+            score = score_for_component(scores, component_name)
+            radius = score * 200
+            angle_deg = angle_for_axis(i)
+            angle_rad = math.radians(angle_deg)
+            px = cx + radius * math.cos(angle_rad)
+            py = cy + radius * math.sin(angle_rad)
+            points.append(f"{px:.1f}, {py:.1f}")
+        svg += f'<polygon points="{" ".join(points)}" fill="{gen_color}" fill-opacity="0.15" stroke="{gen_color}" stroke-width="2"/>'
+
+        for i, component_name in enumerate(component_order):
+            score = score_for_component(scores, component_name)
+            radius = score * 200
+            angle_deg = angle_for_axis(i)
+            angle_rad = math.radians(angle_deg)
+            px = cx + radius * math.cos(angle_rad)
+            py = cy + radius * math.sin(angle_rad)
+            svg += f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="white" stroke="{gen_color}" stroke-width="2"/><title>{gen}: {score:.3f}</title>'
+
+    # Draw axis labels
+    for i, component_name in enumerate(component_order):
+        label = _COMPONENT_LABEL.get(component_name, component_name)
+        label_x, label_y, _ = xyz_from_axis(i)
+        # Determine text-anchor based on position
+        angle_deg = angle_for_axis(i)
+        if 0 <= angle_deg <= 90 or 270 <= angle_deg <= 360:
+            anchor = "start"
+        elif 90 < angle_deg <= 180 or 180 < angle_deg <= 270:
+            anchor = "end"
+        else:
+            anchor = "middle"
+        svg += f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" dominant-baseline="middle" font-size="11" fill="#555">{html.escape(label)}</text>'
+
+    svg += '</svg>'
+    return svg
+
+
 def _generator_color(generator: str) -> str:
     if generator == "maze":
         return "#2d6cdf"
     if generator == "braid":
         return "#d35400"
     return "#444444"
+
+
+def render_component_bars_svg(
+    component_means: Dict[str, Dict[str, float]],
+    component_order: List[str],
+) -> str:
+    generators = sorted(component_means.keys())
+    n_gens = max(1, len(generators))
+    label_w = 160
+    bar_max_w = 310
+    bar_h = 16
+    bar_gap = 6
+    row_h = n_gens * (bar_h + bar_gap) + 14
+    guide_ratios = [0.25, 0.5, 0.75, 1.0]
+    svg_w = label_w + bar_max_w + 40
+    svg_h = len(component_order) * row_h + 30
+
+    svg = f'<svg viewBox="0 0 {svg_w} {svg_h}" overflow="visible" width="100%">'
+
+    for ratio in guide_ratios:
+        gx = label_w + ratio * bar_max_w
+        svg += (
+            f'<line x1="{gx:.1f}" y1="0" x2="{gx:.1f}" y2="{svg_h - 18}"'
+            f' stroke="#ddd" stroke-width="1" stroke-dasharray="4 3"/>'
+            f'<text x="{gx:.1f}" y="{svg_h - 4}" text-anchor="middle"'
+            f' font-size="10" fill="#aaa">{ratio:.0%}</text>'
+        )
+
+    for ci, component_name in enumerate(component_order):
+        weight = _COMPONENT_WEIGHT.get(component_name, 0.0)
+        label = _COMPONENT_LABEL.get(component_name, component_name)
+        display_label = f"{label} ({weight:.0%})"
+        row_y = ci * row_h + 16
+        mid_y = row_y + (n_gens * (bar_h + bar_gap) - bar_gap) / 2
+        svg += (
+            f'<text x="{label_w - 6}" y="{mid_y:.1f}" text-anchor="end"'
+            f' dominant-baseline="middle" font-size="11" fill="#444">'
+            f'{html.escape(display_label)}</text>'
+        )
+
+        for gi, gen in enumerate(generators):
+            score = component_means[gen].get(component_name, 0.0)
+            bar_w = max(0.0, min(1.0, score)) * bar_max_w
+            bar_y = row_y + gi * (bar_h + bar_gap)
+            color = _generator_color(gen)
+            svg += (
+                f'<rect x="{label_w}" y="{bar_y:.1f}" width="{bar_w:.1f}"'
+                f' height="{bar_h}" rx="3" fill="{color}" fill-opacity="0.82">'
+                f'<title>{html.escape(gen)}: {component_name} = {score:.3f}</title></rect>'
+            )
+            score_label = f"{score:.3f}"
+            if bar_w >= 38:
+                svg += (
+                    f'<text x="{label_w + bar_w - 4:.1f}" y="{bar_y + bar_h / 2:.1f}"'
+                    f' dominant-baseline="middle" text-anchor="end"'
+                    f' font-size="10" fill="white">{score_label}</text>'
+                )
+            else:
+                svg += (
+                    f'<text x="{label_w + bar_w + 4:.1f}" y="{bar_y + bar_h / 2:.1f}"'
+                    f' dominant-baseline="middle" text-anchor="start"'
+                    f' font-size="10" fill="#555">{score_label}</text>'
+                )
+
+    svg += '</svg>'
+    return svg
+
+
+def _render_component_table(
+    component_breakdown: Dict[str, Dict[str, float]],
+    component_order: List[str],
+) -> str:
+    def _gen_sort_key(g: str) -> Tuple[int, str]:
+        if g == "maze":
+            return (0, g)
+        if g == "braid":
+            return (1, g)
+        return (2, g)
+
+    generators = sorted(component_breakdown.keys(), key=_gen_sort_key)
+    gen_a = generators[0] if generators else None
+    gen_b = generators[1] if len(generators) >= 2 else None
+
+    header = '<th onclick="sortTable(this)" style="cursor:pointer">Component</th>'
+    header += '<th onclick="sortTable(this)" style="cursor:pointer">Weight</th>'
+    for gen in generators:
+        color = _generator_color(gen)
+        header += (
+            f'<th onclick="sortTable(this)" style="cursor:pointer;color:{color}">'
+            f'{html.escape(gen)}</th>'
+        )
+    if gen_a and gen_b:
+        header += (
+            f'<th onclick="sortTable(this)" style="cursor:pointer">'
+            f'Δ ({html.escape(gen_a)}−{html.escape(gen_b)})</th>'
+            '<th onclick="sortTable(this)" style="cursor:pointer">Winner</th>'
+        )
+
+    rows: List[str] = []
+    for component_name in component_order:
+        weight = _COMPONENT_WEIGHT.get(component_name, 0.0)
+        label = _COMPONENT_LABEL.get(component_name, component_name)
+        cells = f'<td>{html.escape(label)}</td><td>{weight:.0%}</td>'
+        scores: List[float] = []
+        for gen in generators:
+            score = component_breakdown[gen].get(component_name, 0.0)
+            scores.append(score)
+            color = _generator_color(gen)
+            cells += f'<td style="color:{color}">{score:.3f}</td>'
+        if gen_a and gen_b and len(scores) >= 2:
+            delta = scores[0] - scores[1]
+            if abs(delta) < 0.001:
+                cells += '<td>≈ 0.000</td><td>—</td>'
+            elif delta > 0:
+                cells += f'<td class="comp-delta-pos">+{delta:.3f}</td><td>{html.escape(gen_a)}</td>'
+            else:
+                cells += f'<td class="comp-delta-neg">{delta:.3f}</td><td>{html.escape(gen_b)}</td>'
+        rows.append(f'<tr>{cells}</tr>')
+
+    return (
+        '<table>'
+        f'<thead><tr>{header}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody>'
+        '</table>'
+    )
 
 
 def render_visual_summary_html(visual: Dict[str, Any]) -> str:
@@ -1783,6 +2067,15 @@ def render_visual_summary_html(visual: Dict[str, Any]) -> str:
       border-radius: 50%;
       display: inline-block;
     }}
+
+    .tab-bar {{ display: flex; gap: 6px; margin-bottom: 12px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }}
+    .tab-btn {{ padding: 5px 14px; border: 1px solid var(--line); border-radius: 6px;
+               background: var(--bg); color: var(--muted); cursor: pointer; font-size: 13px; }}
+    .tab-btn.active {{ background: var(--accent); color: white; border-color: var(--accent); }}
+    .tab-pane {{ display: none; }}
+    .tab-pane.active {{ display: block; padding-top: 8px; }}
+    .comp-delta-pos {{ color: #1e8a35; font-weight: 600; }}
+    .comp-delta-neg {{ color: #c0392b; font-weight: 600; }}
   </style>
 </head>
 <body>
@@ -1820,6 +2113,8 @@ def render_visual_summary_html(visual: Dict[str, Any]) -> str:
       {scatter_svg}
     </div>
 
+    {_render_component_panel(visual)}
+
     <div class="panel">
       <h2>Top Runs By Quality</h2>
       <table>
@@ -1840,6 +2135,29 @@ def render_visual_summary_html(visual: Dict[str, Any]) -> str:
       </table>
     </div>
   </div>
+  <script>
+  function showTab(panelId, btn) {{
+    var panel = document.getElementById(panelId);
+    panel.querySelectorAll('.tab-pane').forEach(function(t) {{ t.classList.remove('active'); }});
+    panel.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+    document.getElementById(btn.getAttribute('data-tab')).classList.add('active');
+    btn.classList.add('active');
+  }}
+  function sortTable(th) {{
+    var table = th.closest('table');
+    var tbody = table.querySelector('tbody');
+    var idx = Array.from(th.parentNode.children).indexOf(th);
+    var asc = th.dataset.asc !== 'true';
+    th.dataset.asc = asc;
+    Array.from(tbody.querySelectorAll('tr')).sort(function(a, b) {{
+      var av = a.children[idx].textContent.trim();
+      var bv = b.children[idx].textContent.trim();
+      var an = parseFloat(av), bn = parseFloat(bv);
+      if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
+      return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+    }}).forEach(function(tr) {{ tbody.appendChild(tr); }});
+  }}
+  </script>
 </body>
 </html>
 """
