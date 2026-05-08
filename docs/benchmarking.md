@@ -70,9 +70,16 @@ Key flags:
    - `benchmarks/results/benchmark_<timestamp>.json` — full metrics per run.
    - `benchmarks/results/benchmark_<timestamp>.csv` — flat table for spreadsheet analysis.
    - ASCII Pareto chart in terminal (quality vs time; `M`/`m` = maze, `B`/`b` = braid, uppercase = Pareto-frontier).
-   - `benchmarks/results/visual_summary_<timestamp>.html` — cards per generator, per-report table, SVG scatter plot, top-runs table.
+   - `benchmarks/results/visual_summary_<timestamp>.html` — cards per generator, per-report table, SVG scatter plot, top-runs table, and a **Component Breakdown** panel (see below).
 
-5. **Golden regression** — `--update-golden` snapshots quality scores and times for the first 3 seeds at the middle size into `benchmarks/golden_seeds.json`. `--check-golden` on a later run exits 1 if quality drops by more than 3 points or generation time grows by more than 35%.
+5. **Component Breakdown panel** — The HTML report includes a tabbed panel showing per-generator mean scores for each of the 12 quality components across all successful runs:
+   - **Radar** — spider/radar SVG with one polygon per generator.
+   - **Bar Chart** — horizontal bars per component, labelled with weight and numeric score.
+   - **Table** — sortable table with a Δ column and winner column when two generators are present.
+
+   The panel is driven by `COMPONENT_ORDER`, `_COMPONENT_WEIGHT`, and `_COMPONENT_LABEL` module-level constants in `benchmark.py`.
+
+6. **Golden regression** — `--update-golden` snapshots quality scores and times for the first 3 seeds at the middle size into `benchmarks/golden_seeds.json`. `--check-golden` on a later run exits 1 if quality drops by more than 3 points or generation time grows by more than 35%.
 
 ---
 
@@ -101,6 +108,34 @@ Key flags:
 - Backtrack pressure proxy: simulated "limited-memory agent" overhead vs optimal.
 - Local recoverability: if player chooses wrong at a junction, expected cost to recover.
 - Exploration coverage curve: % maze discovered over steps (pace of novelty).
+
+---
+
+## Scoring Notes
+
+### Hard constraint failures double-penalize
+
+When `hard_pass = False`, the score takes two separate hits:
+
+1. **Component weight** — `hard_constraints` = `float(hard_pass)` = `0.0`, so the 18% weight block contributes nothing to the base score (up to −18 points).
+2. **Direct deductions** applied on top of the weighted sum:
+   - Not connected: −35
+   - `min_degree < 2`: −25 × (2 − min_degree)
+   - Dead ends: −min(25, dead_ends × 4)
+   - 2×2 squares: −min(20, count_2x2 × 6)
+   - Narrow 2×N loops: −min(15, narrow_total × 1.5)
+
+A maze failing multiple hard constraints can lose 50+ points from penalties alone, which combined with the correlated degradation of structural metrics (loop depth, tiny-loop suppression, etc.) readily drives the total to 0.
+
+### Why both generators currently score 0 and braid always fails `hard_pass`
+
+`hard_pass` requires `narrow_total == 0` — meaning **no 2×N rectangular perimeter loops for any N from 3 up to `min(12, max(rows, cols))`**. This is a strict standard that neither generator currently meets:
+
+- **braid_maze**: `finalize_playable_maze` removes dead ends and 2×2 squares but makes no attempt to eliminate wider 2×N loops. Braid mazes need many loops everywhere to avoid dead ends, so 2×3, 2×4, etc. loops are unavoidable. `hard_pass` fails on every single run (0%).
+
+- **maze**: `_enforce_constraints` tries to remove thin rectangles, but its detection algorithm differs from the benchmark's `narrow_rectangle_loop_counts`, and later passes (`_add_long_loops`, `_break_long_hallways`) can introduce new narrow rectangles that are not re-checked.
+
+Until the generators are updated to suppress 2×N loops, `hard_pass` rates will remain near 0 and quality scores will be heavily penalized.
 
 ---
 
